@@ -19,25 +19,6 @@ chmod +x scripts/*.sh
 - По умолчанию `scripts/setup.sh` устанавливает зависимости из `requirements-gpu.txt`. Если такого файла нет, либо создайте его на основе `requirements.txt`, либо замените в скрипте строку на `pip install -r requirements.txt`.
 - `scripts/run_lab.sh` использует `--no-browser`. Откройте вручную `http://127.0.0.1:8888/lab`, либо уберите флаг в скрипте, чтобы браузер открывался автоматически.
 
-## Быстрый старт
-
-```bash
-# 1) Создать venv
-python3 -m venv .venv
-
-# 2) Активировать
-source .venv/bin/activate
-
-# 3) Установить зависимости
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# 4) Запустить JupyterLab (откроется сайт в браузере)
-jupyter lab
-```
-
-В браузере откроется интерфейс по адресу `http://127.0.0.1:8888/lab`. Создайте новый Notebook и выберите ядро “Python (rl-homework)” при необходимости.
-
 ## Ядро для Jupyter
 
 Чтобы ядро из venv было видно в Jupyter:
@@ -56,12 +37,3 @@ if torch.cuda.is_available():
 PY
 ```
 
-Если GPU недоступен или драйвер не подходит, можно перейти на CPU‑сборки PyTorch, заменив индекс в `requirements.txt` на `https://download.pytorch.org/whl/cpu` и переустановив пакеты.
-
-## Полезные команды
-
-```bash
-pip check
-pip install pipdeptree && pipdeptree --warn fail
-pip freeze > requirements-lock.txt
-```
