@@ -83,7 +83,9 @@ class TaxiWrapper(gym.Wrapper):
                     print('episode ' , i, ' reward: ', reward_sum)
                     break
 
-        self.save_results()
+        if saveWeights:
+            self.save_results()
+
         self.print_results()
 
     
