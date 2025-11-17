@@ -1,11 +1,13 @@
 import gymnasium as gym
 import numpy as np
 from dataclasses import dataclass
+import matplotlib as plt
+import os
 
 @dataclass
 class Config:
-    lr: float = 0.001 #alpha - то,насколько новое значение обновляет старое 
-    gamma: float = 0.95 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
+    lr: float = 0.01 #alpha - то,насколько новое значение обновляет старое 
+    gamma: float = 0.1 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
     epsilon: float = 0.95 # степень исследования - вероятность того, что в какой-то момент времени агент сделает рандомное действие
 
 
@@ -81,12 +83,75 @@ class TaxiWrapper(gym.Wrapper):
                     print('episode ' , i, ' reward: ', reward_sum)
                     break
 
-            
+        self.save_results()
+        self.print_results()
+
+    
+    def print_results(self):
+        rewards = np.array(self.episode_rewards)
+        episodes = np.arange(len(rewards))
+
+        # Скользящее среднее
+        window = 100
+        if len(rewards) >= window:
+            moving_avg = np.convolve(rewards, np.ones(window)/window, mode="valid")
+        else:
+            moving_avg = None
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(episodes, rewards, label="Награда за эпизод", alpha=0.5)
+
+        if moving_avg is not None:
+            plt.plot(np.arange(window - 1, len(rewards)), moving_avg,
+                    label="Скользящее среднее (100 эпизодов)", linewidth=2)
+
+        plt.xlabel("Эпизод")
+        plt.ylabel("Суммарная награда")
+        plt.title(
+            f"Обучение агента\n"
+            f"Суммарная награда: {rewards.sum():.2f}, "
+            f"Средняя за последние 100 эпизодов: {np.mean(rewards[-100:]):.2f}"
+        )
+        plt.legend()
+        plt.grid(True)
+
+        plt.savefig("reward_plot.png")
+        plt.close()
+        
+
+    def save_results(self):
+        # Сохранение Q-таблицы
+        np.save("q_table.npy", self.Q)
+    
+
+    def load_results(self, filename="q_table.npy"):
+        if not os.path.exists(filename):
+            print(f"Файл '{filename}' не найден. Загрузка невозможна.")
+            return False
+        
+        try:
+            q_loaded = np.load(filename)
+        except Exception as e:
+            print(f"Ошибка при загрузке файла: {e}")
+            return False
+
+        # Проверяем совпадение формы Q-таблицы
+        if q_loaded.shape != self.Q.shape:
+            print(f"Несовместимая форма Q-таблицы! "
+                f"Ожидалось {self.Q.shape}, получено {q_loaded.shape}")
+            return False
+
+        self.Q = q_loaded.copy()
+        print(f"Q-таблица успешно загружена из '{filename}'.")
+        return True
+
+
 
 if __name__ == '__main__':
     
     #Инициализация среды 
     taxiEnv = TaxiWrapper()
+    taxiEnv.load_results()
     taxiEnv.startLearning(1000, False)
 
     
