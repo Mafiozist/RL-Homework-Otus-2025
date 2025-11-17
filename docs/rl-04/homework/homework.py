@@ -1,10 +1,12 @@
 import gymnasium as gym
 import numpy as np
+from dataclasses import dataclass
 
+@dataclass
 class Config:
     lr: float = 0.001 #alpha - то,насколько новое значение обновляет старое 
-    gamma: float = 0.99 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
-    epsilon: float = 0.1 # степень исследования - вероятность того, что в какой-то момент времени агент сделает рандомное действие
+    gamma: float = 0.95 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
+    epsilon: float = 0.95 # степень исследования - вероятность того, что в какой-то момент времени агент сделает рандомное действие
 
 
 class TaxiWrapper(gym.Wrapper):
@@ -14,8 +16,8 @@ class TaxiWrapper(gym.Wrapper):
     hyperparams : Config = None
     actions = []
 
-    def __init__(self, hyperparams : Config = {}):
-        env = gym.make('Taxi-v3', 300, render_mode="human")
+    def __init__(self, hyperparams : Config = Config()):
+        env = gym.make('Taxi-v3', render_mode="human")
         self.env = env
         
         #Инициализируем таблицу весов* Q-функции
@@ -23,8 +25,8 @@ class TaxiWrapper(gym.Wrapper):
         
         #Задаем гиперпараметры обучения
         self.hyperparams = hyperparams
-
         self.actions = range(0, env.action_space.n)
+        self.episode_rewards = []
 
         super().__init__(env)
     
@@ -43,19 +45,29 @@ class TaxiWrapper(gym.Wrapper):
                 action = None
 
                 # первый шаг выбираем рандомно на основании маски допустимых действий
-                # при условии, что у нас еще нет наработанного результата в Q-таблице
-                if self.Q[s0][np.argmax(self.Q[s0])] == 0:
+                # с учетом коэффициента исследования
+                if np.random.rand() < self.hyperparams.epsilon:
                     action : int = np.random.choice(allowed_indices)
                 
-                #Иначе мы берем максимальное значение по таблице
+                #Иначе мы берем максимальное значение по таблице с учетом маски
                 else:
-                    action : int = np.argmax(self.Q[s0]) 
+                    q_values = self.Q[s0, allowed_indices]
+                    best_local_index = np.argmax(q_values)
+                    action = allowed_indices[best_local_index]
 
                 # осуществляем действие и получаем обратную связь от среды
                 s, reward, terminated, truncated, info = super().step(action)
 
                 # заносим текущие веса в Q-таблицу
-                self.Q[s0, action] = reward
+                # производим мягкое обновление параметров
+                # gamma * max(Q[S]) - оценка будущей выгоды
+                # reward + gamma * max(Q[S]) - целевое значение Q
+                # reward + gamma * max(Q[S]) - S0, разница между  Q будщим, и старым Q 
+                self.Q[s0, action] += self.hyperparams.lr * (  
+                    reward 
+                    + self.hyperparams.gamma * np.max(self.Q[s]) # будущая выгода
+                    - self.Q[s0, action] # текущая оценка
+                )
                 mask = info['action_mask']
                 s0 = s
                 reward_sum += reward
@@ -73,9 +85,8 @@ class TaxiWrapper(gym.Wrapper):
 
 if __name__ == '__main__':
     
-    #Инициализация среды
+    #Инициализация среды 
     taxiEnv = TaxiWrapper()
-    
     taxiEnv.startLearning(1000, False)
 
     
