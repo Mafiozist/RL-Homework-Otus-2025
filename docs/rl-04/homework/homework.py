@@ -6,9 +6,9 @@ import os
 
 @dataclass
 class Config:
-    lr: float = 0.01 #alpha - то,насколько новое значение обновляет старое 
-    gamma: float = 0.1 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
-    epsilon: float = 0.95 # степень исследования - вероятность того, что в какой-то момент времени агент сделает рандомное действие
+    lr: float = 0.35 #alpha - то,насколько новое значение обновляет старое 
+    gamma: float = 0.9 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
+    epsilon: float = 0.25 # степень исследования - вероятность того, что в какой-то момент времени агент сделает рандомное действие
 
 
 class TaxiWrapper(gym.Wrapper):
@@ -19,7 +19,7 @@ class TaxiWrapper(gym.Wrapper):
     actions = []
 
     def __init__(self, hyperparams : Config = Config()):
-        env = gym.make('Taxi-v3', render_mode="human")
+        env = gym.make('Taxi-v3')
         self.env = env
         
         #Инициализируем таблицу весов* Q-функции
@@ -70,15 +70,18 @@ class TaxiWrapper(gym.Wrapper):
                 allowed_indices = np.where(mask == 1)[0]
                 action = None
 
-                # первый шаг выбираем рандомно на основании маски допустимых действий
-                # с учетом коэффициента исследования
-                if np.random.rand() < self.hyperparams.epsilon:
+                allowed_indices = np.where(mask == 1)[0]
+                q_values = self.Q[s0, allowed_indices]
+
+                should_explore = (
+                    np.random.rand() < self.hyperparams.epsilon or #Если попадает по условию исследования коэфф эпсилон
+                    len(np.unique(q_values)) == 1 #Если только 1 уникальный элемент т.е. еще не было исследований 
+                )
+
+                if should_explore:
                     action : int = np.random.choice(allowed_indices)
-                
                 #Иначе мы берем максимальное значение по таблице с учетом маски
                 else:
-                    q_values = self.Q[s0, allowed_indices]
-                    best_local_index = np.argmax(q_values)
                     action = allowed_indices[best_local_index]
 
                 # осуществляем действие и получаем обратную связь от среды
