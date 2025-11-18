@@ -32,6 +32,30 @@ class TaxiWrapper(gym.Wrapper):
 
         super().__init__(env)
     
+    # метод тестирования политики
+    def test_policy(self, episodes=100, render=False):
+        total_rewards = []
+        for _ in range(episodes):
+            s, info = self.env.reset()
+            mask = info['action_mask']
+            episode_reward = 0
+            
+            while True:
+                allowed_indices = np.where(mask == 1)[0]
+                q_values = self.Q[s, allowed_indices]
+                action = allowed_indices[np.argmax(q_values)]  # Жадная политика
+                
+                s, reward, terminated, truncated, info = super().step(action)
+                mask = info['action_mask']
+                episode_reward += reward
+                
+                if terminated or truncated:
+                    break
+            
+            total_rewards.append(episode_reward)
+        
+        return np.mean(total_rewards), np.std(total_rewards)
+
     def startLearning(self, episodes = 1000, saveWeights = True):
         #Получаем стартовую позицию и маску допустимых действий для текущей позиции
         s0, init_info = self.env.reset()
@@ -60,14 +84,18 @@ class TaxiWrapper(gym.Wrapper):
                 # осуществляем действие и получаем обратную связь от среды
                 s, reward, terminated, truncated, info = super().step(action)
 
+                if terminated or truncated:
+                    target = reward  # max(Q[s_next]) = 0 для терминального состояния
+                else:
+                    target = reward + self.hyperparams.gamma * np.max(self.Q[s])
+
                 # заносим текущие веса в Q-таблицу
                 # производим мягкое обновление параметров
                 # gamma * max(Q[S]) - оценка будущей выгоды
                 # reward + gamma * max(Q[S]) - целевое значение Q
                 # reward + gamma * max(Q[S]) - S0, разница между  Q будщим, и старым Q 
                 self.Q[s0, action] += self.hyperparams.lr * (  
-                    reward 
-                    + self.hyperparams.gamma * np.max(self.Q[s]) # будущая выгода
+                    target # будущая выгода
                     - self.Q[s0, action] # текущая оценка
                 )
                 mask = info['action_mask']
@@ -154,6 +182,6 @@ if __name__ == '__main__':
     #Инициализация среды 
     taxiEnv = TaxiWrapper()
     taxiEnv.load_results()
-    taxiEnv.startLearning(1000, False)
+    taxiEnv.startLearning(250, False)
 
     
