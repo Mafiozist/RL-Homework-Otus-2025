@@ -1,13 +1,13 @@
 import gymnasium as gym
 import numpy as np
 from dataclasses import dataclass
-import matplotlib as plt
+import matplotlib.pyplot as plt
 import os
 
 @dataclass
 class Config:
-    lr: float = 0.35 #alpha - то,насколько новое значение обновляет старое 
-    gamma: float = 0.9 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
+    lr: float = 0.1 #alpha - то,насколько новое значение обновляет старое 
+    gamma: float = 0.99 # коэф дисконтирования - вероятность, что в конретный ход прервется выполнение 
     epsilon: float = 0.25 # степень исследования - вероятность того, что в какой-то момент времени агент сделает рандомное действие
 
 
@@ -32,9 +32,12 @@ class TaxiWrapper(gym.Wrapper):
 
         super().__init__(env)
     
+
     # метод тестирования политики
-    def test_policy(self, episodes=100, render=False):
-        total_rewards = []
+    def test_policy(self, episodes=100, render = False):
+        if render:
+            self.env = gym.make('Taxi-v3', render_mode='human')
+
         for _ in range(episodes):
             s, info = self.env.reset()
             mask = info['action_mask']
@@ -51,12 +54,11 @@ class TaxiWrapper(gym.Wrapper):
                 
                 if terminated or truncated:
                     break
-            
-            total_rewards.append(episode_reward)
-        
-        return np.mean(total_rewards), np.std(total_rewards)
+             
+        return np.mean(self.episode_rewards), np.std(self.episode_rewards)
 
-    def startLearning(self, episodes = 1000, saveWeights = True):
+
+    def start_learning(self, episodes = 1000, saveWeights = False):
         #Получаем стартовую позицию и маску допустимых действий для текущей позиции
         s0, init_info = self.env.reset()
         mask = init_info['action_mask']
@@ -70,7 +72,6 @@ class TaxiWrapper(gym.Wrapper):
                 allowed_indices = np.where(mask == 1)[0]
                 action = None
 
-                allowed_indices = np.where(mask == 1)[0]
                 q_values = self.Q[s0, allowed_indices]
 
                 should_explore = (
@@ -80,9 +81,8 @@ class TaxiWrapper(gym.Wrapper):
 
                 if should_explore:
                     action : int = np.random.choice(allowed_indices)
-                #Иначе мы берем максимальное значение по таблице с учетом маски
                 else:
-                    action = allowed_indices[best_local_index]
+                    action = allowed_indices[np.argmax(q_values)]
 
                 # осуществляем действие и получаем обратную связь от среды
                 s, reward, terminated, truncated, info = super().step(action)
@@ -106,12 +106,11 @@ class TaxiWrapper(gym.Wrapper):
                 reward_sum += reward
 
                 #Если получаем знак остановки сбрасываем среду, но продолжаем работать по уже готовой таблице
-
                 if terminated or truncated:
                     s0, init_info = self.env.reset()
                     mask = init_info['action_mask']
                     self.episode_rewards.append(reward_sum)
-                    print('episode ' , i, ' reward: ', reward_sum)
+                    print(f'episode {i} reward: {reward_sum}')
                     break
 
         if saveWeights:
@@ -142,22 +141,22 @@ class TaxiWrapper(gym.Wrapper):
         plt.ylabel("Суммарная награда")
         plt.title(
             f"Обучение агента\n"
-            f"Суммарная награда: {rewards.sum():.2f}, "
+            f"Суммарная награда за последние 100 эпизодов: {rewards[-100:].sum():.2f}, "
             f"Средняя за последние 100 эпизодов: {np.mean(rewards[-100:]):.2f}"
         )
         plt.legend()
         plt.grid(True)
 
-        plt.savefig("reward_plot.png")
+        plt.savefig("docs/rl-04/homework/reward_plot.png")
         plt.close()
         
 
     def save_results(self):
         # Сохранение Q-таблицы
-        np.save("q_table.npy", self.Q)
+        np.save("docs/rl-04/homework/q_table.npy", self.Q)
     
 
-    def load_results(self, filename="q_table.npy"):
+    def load_results(self, filename="docs/rl-04/homework/q_table.npy"):
         if not os.path.exists(filename):
             print(f"Файл '{filename}' не найден. Загрузка невозможна.")
             return False
@@ -185,6 +184,7 @@ if __name__ == '__main__':
     #Инициализация среды 
     taxiEnv = TaxiWrapper()
     taxiEnv.load_results()
-    taxiEnv.startLearning(250, False)
+    taxiEnv.test_policy(30, render=True)
+    #taxiEnv.start_learning(3500, True)
 
     
