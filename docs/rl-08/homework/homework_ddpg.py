@@ -56,24 +56,27 @@ class Config:
     # Скорости обучения для Actor и Critic
     # Обычно Critic обучается немного быстрее, чем Actor
     lr_actor: float = 1e-4
-    lr_critic: float = 1e-3
+    lr_critic: float = 3e-4
 
     # Параметры для replay buffer
     buffer_size: int = 100000  # Максимальный размер буфера опыта
-    batch_size: int = 64  # Размер батча для обучения
+    batch_size: int = 512  # Размер батча для обучения
 
     # Параметры для target networks
     tau: float = 0.005  # Коэффициент мягкого обновления (очень мал для стабильности)
 
     # Параметры для exploration noise (Ornstein-Uhlenbeck)
     ou_theta: float = 0.15  # Скорость возврата к среднему
-    ou_sigma: float = 0.2  # Волатильность шума (больше = больше исследование)
+    ou_sigma: float = 0.3  # Волатильность шума (больше = больше исследование)
     ou_dt: float = 0.01  # Временной шаг для OU-процесса
 
     # Параметры обучения
-    total_episodes: int = 200  # Максимальное количество эпизодов
+    total_episodes: int = 3500  # Максимальное количество эпизодов
     train_freq: int = 1  # Частота обучения (каждые N шагов)
     train_steps: int = 1  # Количество шагов обучения за раз
+    
+    # Параметры для устойчивости обучения
+    grad_clip_norm: float = 1.75  # Максимальная норма градиента для clipping
 
     # Окно для усреднения награды
     log_window: int = 100
@@ -90,6 +93,18 @@ class Config:
     save_dir: str = "docs/rl-08/homework"
     model_name: str = "ddpg_carracing"
     plot_name: str = "ddpg_reward_plot.png"
+    
+    # Автоматическое сохранение и загрузка checkpoint
+    auto_save_best: bool = True  # Автоматически сохранять при улучшении
+    auto_load_checkpoint: bool = True  # Автоматически загружать веса при старте, если они есть
+    improvement_threshold: float = 50.0  # Минимальное улучшение награды для сохранения (например, +50)
+    save_best_only: bool = True  # Сохранять только лучшие веса (True) или также промежуточные (False)
+    
+    # Параметры для адаптивной смешанной выборки из буфера
+    mixed_sampling_buffer_fill: float = 0.7  # Минимальная заполненность буфера для смешанной выборки (0.7 = 70%)
+    mixed_sampling_good_ratio_start: float = 0.8  # Доля хороших примеров в начале (0.8 = 80% хороших, 20% случайных)
+    mixed_sampling_good_ratio_end: float = 0.4  # Доля хороших примеров при достижении цели (0.4 = 40% хороших, 60% случайных)
+    mixed_sampling_reward_offset: float = 50.0  # Дополнительный порог к среднему для хороших примеров (среднее + offset)
 
     # Выбираем GPU, если он доступен
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -113,16 +128,16 @@ class CNNEncoder(nn.Module):
         super().__init__()
 
         # Последовательность сверточных слоев для извлечения признаков
-        # Каждый слой уменьшает пространственное разрешение и увеличивает глубину
+        # Уменьшенная архитектура для более быстрого обучения и меньшего количества параметров
         self.conv = nn.Sequential(
             # Первый слой: большая свертка с большим шагом для быстрого уменьшения размера
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            nn.Conv2d(in_channels, 16, kernel_size=8, stride=4),
             nn.ReLU(),
             # Второй слой: средняя свертка для дальнейшего сжатия
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2),
             nn.ReLU(),
             # Третий слой: маленькая свертка для тонкой обработки
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1),
             nn.ReLU(),
         )
 
@@ -136,7 +151,7 @@ class CNNEncoder(nn.Module):
         # Полносвязный слой для финального представления признаков
         self.fc = nn.Sequential(
             nn.Flatten(),  # Преобразуем многомерный тензор в вектор
-            nn.Linear(feat_dim, 512),  # Сжимаем до 512 признаков
+            nn.Linear(feat_dim, 256),  # Сжимаем до 256 признаков
             nn.ReLU(),
         )
 
@@ -148,7 +163,7 @@ class CNNEncoder(nn.Module):
             x: Тензор изображений [batch_size, channels, height, width]
         
         Returns:
-            Вектор признаков [batch_size, 512]
+            Вектор признаков [batch_size, 256]
         """
         return self.fc(self.conv(x))
 
@@ -173,8 +188,10 @@ class ActorNet(nn.Module):
         super().__init__()
         # Энкодер для извлечения признаков из изображения
         self.encoder = CNNEncoder(in_channels, out_h, out_w)
+        # Промежуточный слой для более глубокого представления
+        self.hidden = nn.Linear(256, 128)
         # Голова сети, которая преобразует признаки в действия
-        self.head = nn.Linear(512, action_dim)
+        self.head = nn.Linear(128, action_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -189,15 +206,20 @@ class ActorNet(nn.Module):
         """
         # Извлекаем признаки из изображения
         features = self.encoder(x)
+        # Проходим через промежуточный слой
+        hidden = F.relu(self.hidden(features))
         # Преобразуем признаки в действия
-        actions = self.head(features)
+        actions = self.head(hidden)
         
         # Применяем активации для ограничения диапазона действий
         # Руль: tanh ограничивает в [-1, 1]
         # Газ и тормоз: sigmoid ограничивает в [0, 1]
-        actions[:, 0] = torch.tanh(actions[:, 0])  # руль
-        actions[:, 1] = torch.sigmoid(actions[:, 1])  # газ
-        actions[:, 2] = torch.sigmoid(actions[:, 2])  # тормоз
+        steering = torch.tanh(actions[:, 0:1])  # руль
+        gas = torch.sigmoid(actions[:, 1:2])  # газ
+        brake = torch.sigmoid(actions[:, 2:3])  # тормоз
+        
+        # Объединяем действия обратно в один тензор
+        actions = torch.cat([steering, gas, brake], dim=1)
         
         return actions
 
@@ -219,9 +241,11 @@ class CriticNet(nn.Module):
         # Энкодер для извлечения признаков из изображения
         self.encoder = CNNEncoder(in_channels, out_h, out_w)
         # Слой для объединения признаков состояния и действия
-        self.fusion = nn.Linear(512 + action_dim, 256)
+        self.fusion = nn.Linear(256 + action_dim, 128)
+        # Промежуточный слой
+        self.hidden = nn.Linear(128, 64)
         # Голова сети, которая выдает Q-значение
-        self.head = nn.Linear(256, 1)
+        self.head = nn.Linear(64, 1)
 
     def forward(self, x: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """
@@ -240,6 +264,8 @@ class CriticNet(nn.Module):
         combined = torch.cat([state_features, a], dim=-1)
         # Проходим через слой объединения
         x = F.relu(self.fusion(combined))
+        # Промежуточный слой
+        x = F.relu(self.hidden(x))
         # Получаем Q-значение
         return self.head(x)
 
@@ -293,25 +319,99 @@ class ReplayBuffer:
         # Циклически обновляем индекс
         self._next_idx = (self._next_idx + 1) % self.buffer_size
 
-    def sample(self, batch_size: int):
+    def sample(self, batch_size: int, avg_reward: float = 0.0, stop_reward: float = 900.0,
+               buffer_fill_threshold: float = 0.7, good_ratio_start: float = 0.8,
+               good_ratio_end: float = 0.4, reward_offset: float = 50.0):
         """
-        Случайно выбирает батч опыта из буфера.
+        Выбирает батч опыта из буфера с адаптивным соотношением хороших/случайных примеров.
+        
+        Если буфер заполнен на buffer_fill_threshold (70%), использует смешанную выборку:
+        - В начале (низкий avg_reward): больше хороших примеров (good_ratio_start, например 80%)
+        - По мере приближения к stop_reward: больше случайных для исследования (good_ratio_end, например 40%)
+        - Хорошие примеры: награды > (среднее + offset)
+        - Остальное: случайная выборка для исследования
         
         Args:
             batch_size: Размер батча
+            avg_reward: Средняя награда для определения порога и прогресса
+            stop_reward: Целевая награда для вычисления прогресса
+            buffer_fill_threshold: Минимальная заполненность буфера (0.7 = 70%)
+            good_ratio_start: Доля хороших примеров в начале (0.8 = 80%)
+            good_ratio_end: Доля хороших примеров при приближении к цели (0.4 = 40%)
+            reward_offset: Дополнительный порог к среднему (среднее + offset)
         
         Returns:
             Кортеж (states, actions, rewards, next_states, dones)
         """
-        # Случайно выбираем индексы из текущего размера буфера
-        indices = [random.randint(0, len(self.buffer) - 1) for _ in range(batch_size)]
+        if len(self.buffer) == 0:
+            raise ValueError("Buffer is empty, cannot sample")
+        
+        # Проверяем условия для смешанной выборки:
+        # 1. Буфер заполнен на buffer_fill_threshold (70%)
+        # 2. Средняя награда строго положительная (> 0)
+        buffer_fill_ratio = len(self.buffer) / self.buffer_size
+        should_use_mixed = (buffer_fill_ratio >= buffer_fill_threshold and avg_reward > 0.0)
+        
+        if should_use_mixed:
+            # Вычисляем прогресс: как близко avg_reward к stop_reward (0.0 = начало, 1.0 = достигли цели)
+            # Ограничиваем сверху 1.0, чтобы не превышать
+            progress = min(avg_reward / stop_reward, 1.0) if stop_reward > 0 else 0.0
+            
+            # Линейная интерполяция между good_ratio_start и good_ratio_end
+            # В начале (progress=0): good_ratio = good_ratio_start (больше хороших)
+            # При приближении к цели (progress→1): good_ratio = good_ratio_end (больше случайных)
+            good_ratio = good_ratio_start * (1.0 - progress) + good_ratio_end * progress
+            
+            # Вычисляем количество хороших и случайных примеров
+            num_good = int(batch_size * good_ratio)
+            num_random = batch_size - num_good
+            
+            # Извлекаем все награды
+            rewards_array = np.array([self.buffer[i][2] for i in range(len(self.buffer))])
+            
+            # Порог для хороших примеров: средняя награда + offset
+            threshold = avg_reward + reward_offset
+            
+            # Находим индексы опыта с наградами выше порога И строго положительными (> 0)
+            positive_mask = rewards_array > 0.0
+            good_mask = positive_mask & (rewards_array > threshold)
+            if good_mask.sum() > 0:
+                good_indices = np.where(good_mask)[0].tolist()
+                
+                # Выбираем хорошие примеры
+                if len(good_indices) >= num_good:
+                    good_selected = random.sample(good_indices, num_good)
+                else:
+                    # Если хороших примеров меньше, берем все
+                    good_selected = good_indices.copy()
+                    # Дополняем до нужного количества случайными из хороших (с повторениями)
+                    while len(good_selected) < num_good:
+                        good_selected.append(random.choice(good_indices))
+                
+                # Выбираем случайные примеры из всего буфера (исключая уже выбранные хорошие)
+                remaining_indices = [i for i in range(len(self.buffer)) if i not in good_selected]
+                if len(remaining_indices) >= num_random:
+                    random_selected = random.sample(remaining_indices, num_random)
+                else:
+                    # Если осталось мало, дополняем из всего буфера
+                    random_selected = remaining_indices.copy()
+                    while len(random_selected) < num_random:
+                        random_selected.append(random.choice(range(len(self.buffer))))
+                
+                selected_indices = good_selected + random_selected
+            else:
+                # Если нет хороших примеров, используем полностью случайную выборку
+                selected_indices = random.sample(range(len(self.buffer)), batch_size)
+        else:
+            # Полностью случайная выборка (если буфер не заполнен достаточно)
+            selected_indices = random.sample(range(len(self.buffer)), batch_size)
         
         # Извлекаем данные по выбранным индексам
-        states = [self.buffer[i][0] for i in indices]
-        actions = [self.buffer[i][1] for i in indices]
-        rewards = [self.buffer[i][2] for i in indices]
-        next_states = [self.buffer[i][3] for i in indices]
-        dones = [self.buffer[i][4] for i in indices]
+        states = [self.buffer[i][0] for i in selected_indices]
+        actions = [self.buffer[i][1] for i in selected_indices]
+        rewards = [self.buffer[i][2] for i in selected_indices]
+        next_states = [self.buffer[i][3] for i in selected_indices]
+        dones = [self.buffer[i][4] for i in selected_indices]
         
         return states, actions, rewards, next_states, dones
 
@@ -374,6 +474,9 @@ class OrnsteinUhlenbeckActionNoise:
         self.x_prev = x
         return x
 
+    def set_sigma(self, sigma):
+        self.sigma=sigma
+
     def reset(self):
         """Сбрасывает процесс в начальное состояние."""
         self.x_prev = self.x0 if self.x0 is not None else np.zeros_like(self.mu)
@@ -423,6 +526,19 @@ class CarRacingDDPG:
         self.actor = ActorNet(self.in_channels, self.action_dim, cfg.out_h, cfg.out_w).to(cfg.device)
         self.critic = CriticNet(self.in_channels, self.action_dim, cfg.out_h, cfg.out_w).to(cfg.device)
 
+        # Инициализация весов для лучшей сходимости
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                m.bias.data.fill_(0.01)
+            elif isinstance(m, nn.Conv2d):
+                torch.nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+
+        self.actor.apply(init_weights)
+        self.critic.apply(init_weights)
+
         # Создаем целевые сети (копии основных)
         # Целевые сети обновляются медленно и используются для стабильного обучения
         self.actor_target = ActorNet(self.in_channels, self.action_dim, cfg.out_h, cfg.out_w).to(cfg.device)
@@ -459,8 +575,19 @@ class CarRacingDDPG:
         self.episode_rewards = []
         self.recent_rewards = deque(maxlen=cfg.log_window)
 
+        # Для отслеживания лучшей награды и автоматического сохранения
+        self.best_reward = float('-inf')  # Лучшая средняя награда за последние N эпизодов
+        self.best_episode = 0  # Номер эпизода с лучшей наградой
+        self.last_saved_reward = float('-inf')  # Последняя награда, при которой было сохранение
+
         # Создаем директорию для сохранения результатов
         os.makedirs(cfg.save_dir, exist_ok=True)
+        
+        # Автоматическая загрузка checkpoint при старте, если он существует
+        if cfg.auto_load_checkpoint:
+            loaded = self.load_checkpoint(silent=False)
+            if not loaded:
+                print("Checkpoint не найден. Начинаем обучение с нуля.")
 
     def preprocess_obs(self, obs: np.ndarray) -> torch.Tensor:
         """
@@ -559,13 +686,16 @@ class CarRacingDDPG:
             rewards: Список полученных наград
             next_states: Список следующих состояний
             dones: Список флагов завершения эпизода
+        
+        Returns:
+            dict: Словарь с метриками обучения (losses, Q-values, gradients)
         """
         # Преобразуем данные в тензоры
         states_t = torch.stack(states).to(self.cfg.device)
-        actions_t = torch.tensor(actions, dtype=torch.float32).to(self.cfg.device)
-        rewards_t = torch.tensor(rewards, dtype=torch.float32).to(self.cfg.device).unsqueeze(1)
+        actions_t = torch.from_numpy(np.array(actions)).float().to(self.cfg.device)
+        rewards_t = torch.from_numpy(np.array(rewards)).float().to(self.cfg.device).unsqueeze(1)
         next_states_t = torch.stack(next_states).to(self.cfg.device)
-        dones_t = torch.tensor(dones, dtype=torch.float32).to(self.cfg.device).unsqueeze(1)
+        dones_t = torch.from_numpy(np.array(dones)).float().to(self.cfg.device).unsqueeze(1)
 
         # ========== ОБУЧЕНИЕ CRITIC (Q-сеть) ==========
         # Минимизируем ошибку предсказания Q-значений
@@ -588,6 +718,7 @@ class CarRacingDDPG:
         # Функция потерь: MSE между текущими и целевыми Q-значениями
         critic_loss = F.mse_loss(q_current, q_target)
         critic_loss.backward()
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.grad_clip_norm)
         self.critic_opt.step()
 
         # ========== ОБУЧЕНИЕ ACTOR (политика) ==========
@@ -598,21 +729,33 @@ class CarRacingDDPG:
         # Получаем действия от текущей политики: μ(s)
         current_actions = self.actor(states_t)
         
-        # Временно отключаем градиенты Critic при обучении Actor
-        # Это нужно, чтобы градиенты не распространялись обратно в Critic
-        for param in self.critic.parameters():
-            param.requires_grad = False
-        
         # Вычисляем Q-значения для действий от текущей политики
+        # Градиенты должны идти через Critic к Actor
         q_values = self.critic(states_t, current_actions)
+        
         # Максимизируем Q-значения (минимизируем отрицательные)
         actor_loss = -q_values.mean()
         actor_loss.backward()
+        
+        # Обрезаем градиенты только для Actor (не для Critic)
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.grad_clip_norm)
         self.actor_opt.step()
         
-        # Включаем градиенты Critic обратно
-        for param in self.critic.parameters():
-            param.requires_grad = True
+        # Очищаем градиенты Critic, которые могли накопиться при backward()
+        # (мы не хотим обновлять Critic при обучении Actor)
+        self.critic_opt.zero_grad()
+        
+        # Возвращаем метрики для логирования
+        with torch.no_grad():
+            return {
+                "critic_loss": critic_loss.item(),
+                "actor_loss": actor_loss.item(),
+                "q_current_mean": q_current.mean().item(),
+                "q_target_mean": q_target.mean().item(),
+                "q_values_mean": q_values.mean().item(),
+                "critic_grad_norm": critic_grad_norm.item(),
+                "actor_grad_norm": actor_grad_norm.item(),
+            }
 
     def update_target_networks(self):
         """
@@ -656,6 +799,17 @@ class CarRacingDDPG:
         pbar = trange(self.cfg.total_episodes, desc="Training")
 
         step_count = 0  # Счетчик шагов для определения частоты обучения
+        
+        # Для накопления метрик за эпизод
+        episode_metrics = {
+            "critic_loss": [],
+            "actor_loss": [],
+            "q_current_mean": [],
+            "q_target_mean": [],
+            "q_values_mean": [],
+            "critic_grad_norm": [],
+            "actor_grad_norm": [],
+        }
 
         for ep in pbar:
             # Запускаем новый эпизод
@@ -666,6 +820,10 @@ class CarRacingDDPG:
 
             # Сбрасываем OU-шум в начале каждого эпизода
             self.ou_noise.reset()
+            
+            # Сбрасываем метрики эпизода
+            for key in episode_metrics:
+                episode_metrics[key].clear()
 
             # Выполняем шаги до завершения эпизода
             while not done:
@@ -689,12 +847,22 @@ class CarRacingDDPG:
                     if step_count % self.cfg.train_freq == 0:
                         # Выполняем несколько шагов обучения
                         for _ in range(self.cfg.train_steps):
-                            # Случайно выбираем батч из буфера
+                            # Выбираем батч из буфера (адаптивная смешанная выборка при заполнении буфера на 70%+)
+                            avg_reward = float(np.mean(self.recent_rewards)) if len(self.recent_rewards) > 0 else 0.0
                             states, actions, rewards, next_states, dones = self.buffer.sample(
-                                self.cfg.batch_size
+                                batch_size=self.cfg.batch_size,
+                                avg_reward=avg_reward,
+                                stop_reward=self.cfg.stop_reward,
+                                buffer_fill_threshold=self.cfg.mixed_sampling_buffer_fill,
+                                good_ratio_start=self.cfg.mixed_sampling_good_ratio_start,
+                                good_ratio_end=self.cfg.mixed_sampling_good_ratio_end,
+                                reward_offset=self.cfg.mixed_sampling_reward_offset
                             )
-                            # Выполняем один шаг обучения
-                            self.optimize(states, actions, rewards, next_states, dones)
+                            # Выполняем один шаг обучения и получаем метрики
+                            metrics = self.optimize(states, actions, rewards, next_states, dones)
+                            # Сохраняем метрики
+                            for key in metrics:
+                                episode_metrics[key].append(metrics[key])
                             # Мягко обновляем целевые сети
                             self.update_target_networks()
 
@@ -709,12 +877,83 @@ class CarRacingDDPG:
             self.recent_rewards.append(ep_reward)
 
             avg_r = float(np.mean(self.recent_rewards))
+            
+            # Проверяем на улучшение и сохраняем при необходимости
+            if self.cfg.auto_save_best and len(self.recent_rewards) >= min(self.cfg.log_window, 10):
+                # Обновляем лучшую награду, если текущая средняя лучше
+                if avg_r > self.best_reward:
+                    improvement = avg_r - self.best_reward
+                    
+                    # Для первого сохранения (best_reward == -inf) сохраняем сразу
+                    # Для последующих сохраняем только при достаточном улучшении
+                    should_save = (self.best_reward == float('-inf')) or (improvement >= self.cfg.improvement_threshold)
+                    
+                    if should_save:
+                        old_best = self.best_reward
+                        self.best_reward = avg_r
+                        self.best_episode = ep
+                        self.last_saved_reward = avg_r
+                        
+                        # Сохраняем лучший checkpoint
+                        self.save_models(suffix="_best")
+                        
+                        # Если нужно сохранять промежуточные, также сохраняем обычный
+                        if not self.cfg.save_best_only:
+                            self.save_models(suffix="")
+                        
+                        if old_best != float('-inf'):
+                            print(f"\n[Ep {ep}] Улучшение: {old_best:.1f} → {avg_r:.1f} (+{improvement:.1f})")
+                    else:
+                        # Обновляем best_reward даже без сохранения, если улучшение меньше порога
+                        self.best_reward = avg_r
+                        self.best_episode = ep
+            
+            # Вычисляем средние метрики за эпизод
+            if episode_metrics["critic_loss"]:
+                avg_critic_loss = np.mean(episode_metrics["critic_loss"])
+                avg_actor_loss = np.mean(episode_metrics["actor_loss"])
+                avg_q_current = np.mean(episode_metrics["q_current_mean"])
+                avg_q_target = np.mean(episode_metrics["q_target_mean"])
+                avg_q_values = np.mean(episode_metrics["q_values_mean"])
+                avg_critic_grad = np.mean(episode_metrics["critic_grad_norm"])
+                avg_actor_grad = np.mean(episode_metrics["actor_grad_norm"])
+            else:
+                avg_critic_loss = 0.0
+                avg_actor_loss = 0.0
+                avg_q_current = 0.0
+                avg_q_target = 0.0
+                avg_q_values = 0.0
+                avg_critic_grad = 0.0
+                avg_actor_grad = 0.0
 
+            # Определяем статус сохранения для отображения
+            save_status = ""
+            if self.cfg.auto_save_best:
+                if self.best_reward != float('-inf'):
+                    if avg_r >= self.best_reward:
+                        # Проверяем, была ли это награда сохранена
+                        if abs(avg_r - self.last_saved_reward) < 0.1:  # Учитываем погрешность округления
+                            save_status = "★"  # Сохранено
+                        elif avg_r >= self.last_saved_reward + self.cfg.improvement_threshold:
+                            save_status = "★+"  # Готово к сохранению
+                        else:
+                            save_status = "*"  # Лучшее, но еще не сохранено
+                    else:
+                        save_status = f"best:{self.best_reward:.0f}"
+            
             pbar.set_postfix({
                 "avgR": f"{avg_r:.1f}",
                 "lastR": f"{ep_reward:.1f}",
                 "len": f"{ep_length}",
                 "buffer": f"{len(self.buffer)}",
+                "cL": f"{avg_critic_loss:.3f}",
+                "aL": f"{avg_actor_loss:.3f}",
+                "qC": f"{avg_q_current:.1f}",
+                "qT": f"{avg_q_target:.1f}",
+                "qV": f"{avg_q_values:.1f}",
+                "gC": f"{avg_critic_grad:.2f}",
+                "gA": f"{avg_actor_grad:.2f}",
+                "save": save_status,
             })
 
             # Останавливаем обучение, если достигли целевой награды
@@ -722,22 +961,194 @@ class CarRacingDDPG:
                 print(f"\nОбучение остановлено: средняя награда {avg_r:.2f}")
                 break
 
-        # Сохраняем модели и график
+        # Сохраняем финальные модели и график
         if save_weights:
-            self.save_models()
+            # Сохраняем финальные веса (если не были сохранены как best)
+            if not self.cfg.save_best_only or avg_r < self.best_reward:
+                self.save_models(suffix="")
+            print(f"\nОбучение завершено. Лучшая награда: {self.best_reward:.1f} (эпизод {self.best_episode})")
 
         self.save_plot()
 
-    def save_models(self):
-        """Сохраняет веса обученных сетей."""
-        torch.save(
-            self.actor.state_dict(),
-            os.path.join(self.cfg.save_dir, self.cfg.model_name + "_actor.pth")
+    def save_models(self, suffix: str = ""):
+        """
+        Сохраняет веса обученных сетей и полный checkpoint.
+        
+        Args:
+            suffix: Суффикс для имени файла (например, "_best" для лучших весов)
+        """
+        actor_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + suffix + "_actor.pth")
+        critic_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + suffix + "_critic.pth")
+        
+        torch.save(self.actor.state_dict(), actor_path)
+        torch.save(self.critic.state_dict(), critic_path)
+        
+        # Также сохраняем целевые сети, оптимизаторы и метаданные в полный checkpoint
+        checkpoint_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + suffix + "_checkpoint.pth")
+        checkpoint = {
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_target_state_dict': self.actor_target.state_dict(),
+            'critic_target_state_dict': self.critic_target.state_dict(),
+            'actor_optimizer_state_dict': self.actor_opt.state_dict(),
+            'critic_optimizer_state_dict': self.critic_opt.state_dict(),
+            'best_reward': self.best_reward,
+            'best_episode': self.best_episode,
+            'episode_rewards': self.episode_rewards.copy(),
+            'last_saved_reward': self.last_saved_reward,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        
+        if suffix == "_best":
+            print(f"  ✓ Checkpoint сохранен: {checkpoint_path}")
+            print(f"    Best reward: {self.best_reward:.1f} (episode {self.best_episode})")
+
+    def load_checkpoint(self, suffix: str = "_best", silent: bool = False):
+        """
+        Загружает полный checkpoint для продолжения обучения.
+        
+        Загружает веса основных и целевых сетей, состояния оптимизаторов и метаданные
+        (лучшая награда, история эпизодов). Используется для восстановления обучения
+        с последней сохраненной точки.
+        
+        Args:
+            suffix: Суффикс для имени файла (по умолчанию "_best" для лучшего checkpoint)
+            silent: Если True, не выводит сообщения о загрузке
+        
+        Returns:
+            bool: True если checkpoint загружен успешно, False если файл не найден
+        """
+        checkpoint_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + suffix + "_checkpoint.pth")
+        
+        # Пробуем сначала загрузить полный checkpoint
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=self.cfg.device)
+            
+            self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
+            self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+            self.actor_opt.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+            self.critic_opt.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+            
+            # Восстанавливаем метаданные
+            if 'best_reward' in checkpoint:
+                self.best_reward = checkpoint['best_reward']
+            if 'best_episode' in checkpoint:
+                self.best_episode = checkpoint['best_episode']
+            if 'episode_rewards' in checkpoint:
+                self.episode_rewards = checkpoint['episode_rewards'].copy()
+            if 'last_saved_reward' in checkpoint:
+                self.last_saved_reward = checkpoint['last_saved_reward']
+            
+            if not silent:
+                print(f"✓ Checkpoint загружен из {checkpoint_path}")
+                print(f"  Best reward: {self.best_reward:.1f} (episode {self.best_episode})")
+                print(f"  Эпизодов в истории: {len(self.episode_rewards)}")
+            
+            # Переводим в режим обучения (не eval)
+            self.actor.train()
+            self.critic.train()
+            
+            return True
+        
+        # Если полный checkpoint не найден, пробуем загрузить отдельные файлы весов
+        actor_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + suffix + "_actor.pth")
+        critic_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + suffix + "_critic.pth")
+        
+        if os.path.exists(actor_path) and os.path.exists(critic_path):
+            self.actor.load_state_dict(torch.load(actor_path, map_location=self.cfg.device))
+            self.critic.load_state_dict(torch.load(critic_path, map_location=self.cfg.device))
+            
+            # Обновляем целевые сети
+            self.actor_target.load_state_dict(self.actor.state_dict())
+            self.critic_target.load_state_dict(self.critic.state_dict())
+            
+            if not silent:
+                print(f"✓ Веса загружены из {actor_path} и {critic_path}")
+                print(f"  (Оптимизаторы не восстановлены - начнется новый цикл обучения)")
+            
+            self.actor.train()
+            self.critic.train()
+            
+            return True
+        
+        return False
+
+    def load_models(self):
+        """
+        Загружает сохраненные веса Actor и Critic сетей для тестирования.
+        
+        Переводит сети в режим eval для тестирования и выводит подтверждение
+        успешной загрузки. Использует метод load_checkpoint для загрузки.
+        
+        Raises:
+            FileNotFoundError: Если файлы с весами не найдены
+        """
+        # Пробуем загрузить лучший checkpoint
+        if not self.load_checkpoint(suffix="_best", silent=False):
+            # Если не найден, пробуем обычный
+            if not self.load_checkpoint(suffix="", silent=False):
+                actor_path = os.path.join(self.cfg.save_dir, self.cfg.model_name + "_actor.pth")
+                raise FileNotFoundError(f"Checkpoint not found. Expected: {actor_path}")
+        
+        # Для тестирования переводим в режим eval
+        self.actor.eval()
+        self.critic.eval()
+        
+        print(f"Models loaded from {self.cfg.save_dir} (ready for testing)")
+
+    def test(self, num_episodes: int = 5):
+        """
+        Тестирует обученную модель с визуализацией.
+        
+        Загружает сохраненные веса, создает среду с визуализацией (render_mode="human")
+        и запускает указанное количество эпизодов. Действия выбираются детерминистически
+        (без шума) для оценки реальной производительности обученной политики.
+        
+        Args:
+            num_episodes: Количество эпизодов для тестирования
+        
+        Returns:
+            list: Список наград за каждый эпизод
+        """
+        self.load_models()
+        
+        test_env = gym.make(
+            self.cfg.env_id,
+            lap_complete_percent=self.cfg.lap_complete_percent,
+            continuous=self.cfg.continuous,
+            render_mode="human"
         )
-        torch.save(
-            self.critic.state_dict(),
-            os.path.join(self.cfg.save_dir, self.cfg.model_name + "_critic.pth")
-        )
+        
+        assert isinstance(test_env.action_space, gym.spaces.Box)
+        
+        episode_rewards = []
+        
+        for ep in range(num_episodes):
+            obs, _ = test_env.reset()
+            done = False
+            ep_reward = 0.0
+            ep_length = 0
+            
+            while not done:
+                # Выбираем действие детерминистически (без шума)
+                action = self.pick_action(obs, add_noise=False)
+                obs, r, term, trunc, _ = test_env.step(action)
+                done = term or trunc
+                
+                ep_reward += float(r)
+                ep_length += 1
+            
+            episode_rewards.append(ep_reward)
+            print(f"Episode {ep + 1}/{num_episodes}: reward = {ep_reward:.1f}, length = {ep_length}")
+        
+        test_env.close()
+        
+        avg_reward = np.mean(episode_rewards)
+        print(f"\nTest completed: average reward = {avg_reward:.1f} over {num_episodes} episodes")
+        
+        return episode_rewards
 
     def save_plot(self):
         """Сохраняет график наград по эпизодам."""
@@ -773,6 +1184,9 @@ class CarRacingDDPG:
 if __name__ == "__main__":
     cfg = Config()
     trainer = CarRacingDDPG(cfg)
-    trainer.start_learning(save_weights=True)
+    #trainer.start_learning(save_weights=True)
+    
+    # Раскомментируйте для тестирования:
+    trainer.test(num_episodes=5)
 
 
